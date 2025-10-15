@@ -90,6 +90,9 @@ class SensorData(BaseModel):
     d: Optional[str] = None
     pumpRunning: Optional[bool] = None
     pr: Optional[bool] = None
+    # Dosing/reservoir information (new fields)
+    reservoir_size_l: Optional[float] = None
+    dosing_ml: Optional[float] = None
 
 class PredictionRequest(BaseModel):
     sensor_data: Optional[Dict[str, Any]] = None
@@ -213,7 +216,7 @@ class DubionicMonitor:
         self.is_trained = False
         self.sensor_history = []
         self.db = firestore_db
-        logger.info("DubionicMonitor initialized with Firebase")
+        logger.info("Dubionic Monitor initialized with Firebase")
 
     def get_latest_sensor_data(self, user_id):
         """Get latest sensor data from Firebase - matches Node.js server behavior"""
@@ -270,6 +273,19 @@ class DubionicMonitor:
                                 data['timestamp_colombo'] = get_colombo_iso()
                 except Exception:
                     data['timestamp_colombo'] = get_colombo_iso()
+
+            # Compute dose per liter if dosing info present and attach
+            try:
+                dose = data.get('dose_ml_per_l')
+                if dose is None:
+                    r = data.get('reservoir_size_l')
+                    d = data.get('dosing_ml')
+                    if r and d and float(r) > 0:
+                        dose = float(d) / float(r)
+                if dose is not None:
+                    data['dose_ml_per_l'] = float(dose)
+            except Exception:
+                pass
 
             # Cache the result
             cache[cache_key] = {'data': data, 'timestamp': time.time()}
@@ -417,16 +433,28 @@ class DubionicMonitor:
             historical_data = []
             for doc in docs:
                 data = doc.to_dict()
-                # Extract relevant fields for training
+                dose = data.get('dose_ml_per_l')
+                if dose is None:
+                    try:
+                        r = data.get('reservoir_size_l')
+                        d = data.get('dosing_ml')
+                        if r and d and float(r) > 0:
+                            dose = float(d) / float(r)
+                    except Exception:
+                        dose = None
+
                 reading = {
                     'temperature': data.get('airTemp'),
                     'humidity': data.get('humidity'),
                     'water_temp': data.get('waterTemp'),
                     'ph': data.get('ph'),
                     'ec': data.get('ec'),
+                    # If dose missing, default to 1.0 ml/L (your 20ml in 20L baseline)
+                    'dose_ml_per_l': dose if dose is not None else 1.0
                 }
-                # Only include complete readings
-                if all(v is not None for v in reading.values()):
+                # Only include readings where core sensor fields are present
+                core_ok = all(reading.get(k) is not None for k in ['temperature', 'humidity', 'water_temp', 'ph', 'ec'])
+                if core_ok:
                     historical_data.append(reading)
 
             if len(historical_data) < 10:
@@ -443,11 +471,11 @@ class DubionicMonitor:
                 (df['water_temp'] < 18) | (df['water_temp'] > 25),
                 (df['humidity'] < 50) | (df['humidity'] > 85),
             ], [
-                'needs_ph_adjust',
-                'needs_nutrient_adjust',
-                'needs_temp_adjust',
-                'needs_water_temp_adjust',
-                'needs_humidity_adjust'
+                'pH adjustment needed',
+                'nutrient adjustment needed',
+                'air temperature adjustment needed',
+                'water temperature adjustment needed',
+                'humidity adjustment needed'
             ], default='healthy')
 
             df['health_status'] = conditions
@@ -471,6 +499,8 @@ class DubionicMonitor:
             'water_temp': np.random.normal(22, 2, n_samples),
             'ph': np.random.normal(6.0, 0.5, n_samples),
             'ec': np.random.normal(1.5, 0.4, n_samples),
+            # dose per liter in ml/L; default experiment: 20ml in 20L => 1.0 ml/L
+            'dose_ml_per_l': np.random.normal(1.0, 0.2, n_samples),
         }
 
         df = pd.DataFrame(sample_data)
@@ -481,11 +511,11 @@ class DubionicMonitor:
             (df['water_temp'] < 18) | (df['water_temp'] > 25),
             (df['humidity'] < 50) | (df['humidity'] > 85),
         ], [
-            'needs_ph_adjust',
-            'needs_nutrient_adjust',
-            'needs_temp_adjust',
-            'needs_water_temp_adjust',
-            'needs_humidity_adjust'
+            'pH adjustment needed',
+            'nutrient adjustment needed',
+            'air temperature adjustment needed',
+            'water temperature adjustment needed',
+            'humidity adjustment needed'
         ], default='healthy')
 
         df['health_status'] = conditions
@@ -497,7 +527,11 @@ class DubionicMonitor:
             logger.info(f"Starting model training for user {user_id}")
             df = self.create_training_data_optimized(user_id)
 
-            features = ['temperature', 'humidity', 'water_temp', 'ph', 'ec']
+            # Ensure dosing feature is present; if not, fill with default 1.0 ml/L
+            if 'dose_ml_per_l' not in df.columns:
+                df['dose_ml_per_l'] = 1.0
+
+            features = ['temperature', 'humidity', 'water_temp', 'ph', 'ec', 'dose_ml_per_l']
             X = df[features].values
             y_health = df['health_status'].values
 
@@ -509,18 +543,29 @@ class DubionicMonitor:
             X_train_scaled = self.scaler.fit_transform(X_train)
             X_test_scaled = self.scaler.transform(X_test)
 
-            # Train classifier
+            # Train classifier - increased estimators and class balancing for better results
             self.health_classifier = RandomForestClassifier(
-                n_estimators=50,
-                max_depth=10,
+                n_estimators=100,
+                max_depth=12,
                 random_state=42,
-                n_jobs=-1
+                n_jobs=-1,
+                class_weight='balanced'
             )
             self.health_classifier.fit(X_train_scaled, y_health_train)
             self.is_trained = True
 
             # Calculate accuracy
             accuracy = accuracy_score(y_health_test, self.health_classifier.predict(X_test_scaled))
+
+            # Log feature importances if available
+            try:
+                importances = self.health_classifier.feature_importances_
+                fi_pairs = list(zip(features, importances))
+                fi_pairs_sorted = sorted(fi_pairs, key=lambda x: x[1], reverse=True)
+                logger.info(f"Feature importances: {fi_pairs_sorted}")
+                self.feature_importances_ = fi_pairs_sorted
+            except Exception:
+                self.feature_importances_ = None
 
             logger.info(f"Model training completed for {user_id}. Accuracy: {accuracy:.2%}")
             return accuracy
@@ -529,12 +574,35 @@ class DubionicMonitor:
             logger.error(f"Training failed for {user_id}: {e}")
             raise
 
-    def predict_plant_status(self, temperature, humidity, water_temp, ph, ec):
+    def predict_plant_status(self, temperature, humidity, water_temp, ph, ec, dose_ml_per_l: Optional[float] = None):
+        """Predict plant health. Accepts optional dose_ml_per_l (ml per L) to improve accuracy.
+
+        If dose_ml_per_l is not provided, the method will try to use the last saved sensor_history value
+        or fall back to 1.0 ml/L.
+        """
         if not self.is_trained:
             raise Exception("Models not trained. Please train first.")
 
-        features = np.array([[temperature, humidity, water_temp, ph, ec]])
-        features_scaled = self.scaler.transform(features)
+        # Determine expected feature length from scaler (if available)
+        try:
+            expected_features = len(self.scaler.mean_)
+        except Exception:
+            expected_features = 5
+
+        # Fill dose if model expects it
+        if expected_features == 6:
+            if dose_ml_per_l is None:
+                # try last sensor history
+                last_dose = None
+                if self.sensor_history:
+                    last = self.sensor_history[-1]
+                    last_dose = last.get('dose_ml_per_l') if isinstance(last, dict) else None
+                dose_ml_per_l = last_dose if last_dose is not None else 1.0
+            features_arr = np.array([[temperature, humidity, water_temp, ph, ec, float(dose_ml_per_l)]])
+        else:
+            features_arr = np.array([[temperature, humidity, water_temp, ph, ec]])
+
+        features_scaled = self.scaler.transform(features_arr)
         health_status = self.health_classifier.predict(features_scaled)[0]
 
         prediction = {
@@ -544,6 +612,7 @@ class DubionicMonitor:
             'water_temp': water_temp,
             'ph': ph,
             'ec': ec,
+            'dose_ml_per_l': dose_ml_per_l,
             'health_status': health_status,
         }
 
@@ -568,7 +637,6 @@ class DubionicMonitor:
             recommendations.append(f"Low pH ({ph:.1f}): Add pH UP solution")
         elif ph > 6.8:
             recommendations.append(f"High pH ({ph:.1f}): Add pH DOWN solution")
-
         if ec < 1.0:
             recommendations.append(f"Low EC ({ec:.1f}): Increase nutrient concentration")
         elif ec > 2.5:
