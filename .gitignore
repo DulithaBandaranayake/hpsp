@@ -1,0 +1,12 @@
+.venv
+.env
+__pycache__
+*.pyc
+.json
+.jsonl
+instance
+*.sqlite3
+*.log
+.DS_Store
+*.egg-info
+smart-hydroponic-7d894-firebase-adminsdk-*.json
