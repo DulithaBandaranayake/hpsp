@@ -245,6 +245,32 @@ class DubionicMonitor:
             if 'timestamp' in data and hasattr(data['timestamp'], 'to_pydatetime'):
                 data['timestamp'] = data['timestamp'].to_pydatetime()
 
+            # Ensure a Colombo-local ISO timestamp is present for display
+            if 'timestamp_colombo' not in data:
+                try:
+                    # Convert the timestamp (aware or naive) to Asia/Colombo
+                    ts = data.get('timestamp')
+                    if ts is None:
+                        data['timestamp_colombo'] = get_colombo_iso()
+                    else:
+                        try:
+                            from zoneinfo import ZoneInfo
+                            # If ts is naive, assume it's UTC
+                            if ts.tzinfo is None:
+                                ts = ts.replace(tzinfo=timezone.utc)
+                            data['timestamp_colombo'] = ts.astimezone(ZoneInfo('Asia/Colombo')).isoformat()
+                        except Exception:
+                            try:
+                                import pytz
+                                if ts.tzinfo is None:
+                                    ts = ts.replace(tzinfo=timezone.utc)
+                                data['timestamp_colombo'] = ts.astimezone(pytz.timezone('Asia/Colombo')).isoformat()
+                            except Exception:
+                                # fallback
+                                data['timestamp_colombo'] = get_colombo_iso()
+                except Exception:
+                    data['timestamp_colombo'] = get_colombo_iso()
+
             # Cache the result
             cache[cache_key] = {'data': data, 'timestamp': time.time()}
 
@@ -265,7 +291,7 @@ class DubionicMonitor:
             'airTemp': round(20 + np.random.random() * 8, 1),
             'humidity': round(60 + np.random.random() * 20, 1),
             'userId': user_id,
-            'timestamp': datetime.now()
+            'timestamp': get_colombo_iso()
         }
         logger.info(f"Using mock sensor data for user {user_id}")
         return mock_data
@@ -726,6 +752,39 @@ async def receive_sensor_data(
     background_tasks.add_task(lambda: time.sleep(0.1) or process_data())
 
     return response
+
+
+@app.get('/admin/local-sensor-latest')
+async def admin_local_sensor_latest():
+    """Return the last line from the local sensor_data.jsonl fallback for debugging.
+
+    Useful when Firestore is not connected on PythonAnywhere or local dev.
+    """
+    out_path = os.getenv('SENSOR_JSONL_PATH', 'sensor_data.jsonl')
+    if not os.path.exists(out_path):
+        raise HTTPException(status_code=404, detail="Local sensor JSONL not found")
+
+    try:
+        # Read last non-empty line efficiently
+        last_line = None
+        with open(out_path, 'rb') as f:
+            try:
+                f.seek(-2, os.SEEK_END)
+                while f.read(1) != b"\n":
+                    f.seek(-2, os.SEEK_CUR)
+            except OSError:
+                f.seek(0)
+            for line in f:
+                if line.strip():
+                    last_line = line.decode('utf-8')
+
+        if not last_line:
+            raise HTTPException(status_code=404, detail="No entries in local sensor JSONL")
+
+        return JSONResponse(status_code=200, content=json.loads(last_line))
+    except Exception as e:
+        logger.error(f"Error reading local sensor JSONL: {e}")
+        raise HTTPException(status_code=500, detail="Failed to read local sensor JSONL")
 
 @app.post("/train")
 async def train_models(
