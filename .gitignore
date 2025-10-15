@@ -10,3 +10,4 @@ instance
 .DS_Store
 *.egg-info
 smart-hydroponic-7d894-firebase-adminsdk-*.json
+*.sh

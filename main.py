@@ -3,10 +3,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 import jwt
 import os
+import json
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
@@ -186,6 +187,24 @@ def rate_limit_check(client_ip: str):
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
     rate_limit_cache[client_ip].append(now)
 
+
+# Time helpers
+def get_colombo_iso():
+    """Return ISO 8601 timestamp in Asia/Colombo timezone.
+
+    Tries zoneinfo, falls back to pytz if available, otherwise uses a fixed +05:30 offset.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("Asia/Colombo")).isoformat()
+    except Exception:
+        try:
+            import pytz
+            return datetime.now(pytz.timezone("Asia/Colombo")).isoformat()
+        except Exception:
+            # Fallback to fixed offset +05:30
+            return datetime.now(timezone(timedelta(hours=5, minutes=30))).isoformat()
+
 # ----- Monitor class with Firebase Integration -----
 class DubionicMonitor:
     def __init__(self, firestore_db):
@@ -254,9 +273,39 @@ class DubionicMonitor:
     def save_sensor_data(self, sensor_data):
         """Save sensor data to Firebase - matches Node.js server behavior"""
         try:
+            # Always attach Colombo local timestamp for client-side display/audit
+            sensor_data_colombo_ts = get_colombo_iso()
+
             if not self.db:
-                logger.info("Firebase not available, skipping data save")
-                return True
+                # Fallback: write to local JSONL when Firebase unavailable
+                try:
+                    out_path = os.getenv('SENSOR_JSONL_PATH', 'sensor_data.jsonl')
+                    parent = os.path.dirname(out_path)
+                    if parent and not os.path.exists(parent):
+                        os.makedirs(parent, exist_ok=True)
+
+                    processed_local = {
+                        'ph': sensor_data.get('ph') or sensor_data.get('p'),
+                        'ec': sensor_data.get('ec') or sensor_data.get('e'),
+                        'waterTemp': sensor_data.get('waterTemp') or sensor_data.get('wt'),
+                        'airTemp': sensor_data.get('airTemp') or sensor_data.get('at'),
+                        'humidity': sensor_data.get('humidity') or sensor_data.get('h'),
+                        'doorStatus': sensor_data.get('doorStatus') or sensor_data.get('ds') or sensor_data.get('d') or 'unknown',
+                        'pumpRunning': sensor_data.get('pumpRunning') if sensor_data.get('pumpRunning') is not None else sensor_data.get('pr'),
+                        'userId': sensor_data.get('userId') or sensor_data.get('u'),
+                        'timestamp': datetime.utcnow().isoformat(),
+                        'timestamp_colombo': sensor_data_colombo_ts,
+                        'status': 'active'
+                    }
+                    # Remove None values
+                    processed_local = {k: v for k, v in processed_local.items() if v is not None}
+                    with open(out_path, 'a', encoding='utf-8') as f:
+                        f.write(json.dumps(processed_local, ensure_ascii=False) + '\n')
+                    logger.info(f"Saved sensor data to local JSONL fallback: {out_path}")
+                    return True
+                except Exception as e:
+                    logger.error(f"Failed to write sensor data to local JSONL: {e}")
+                    return False
 
             # Process data like Node.js server
             final_user_id = sensor_data.get('userId') or sensor_data.get('u')
@@ -289,6 +338,7 @@ class DubionicMonitor:
                 'pumpRunning': pump_running,
                 'userId': final_user_id,
                 'timestamp': firestore.SERVER_TIMESTAMP,
+                'timestamp_colombo': sensor_data_colombo_ts,
                 'status': 'active'
             }
 
@@ -764,6 +814,48 @@ async def make_prediction(
             },
             "user_id": current_user
         }
+
+        # Persist prediction: Firestore if available, otherwise local JSONL fallback
+        try:
+            # Add Colombo local timestamp alongside server timestamp
+            colombo_ts = get_colombo_iso()
+            doc = {
+                'prediction_id': result['prediction_id'],
+                'user_id': current_user,
+                'health_status': result['health_status'],
+                'recommendations': recommendations,
+                'critical': result['critical'],
+                # store server timestamp for Firestore; fallback uses ISO string
+                'timestamp': firestore.SERVER_TIMESTAMP if (monitor and getattr(monitor, 'db', None)) else datetime.utcnow().isoformat(),
+                'timestamp_colombo': colombo_ts,
+                'sensor_data': result['sensor_data']
+            }
+
+            if monitor and getattr(monitor, 'db', None):
+                try:
+                    # Use prediction_id as document id for idempotency
+                    monitor.db.collection('predictions').document(result['prediction_id']).set(doc)
+                    logger.info(f"Saved prediction {result['prediction_id']} to Firestore for user {current_user}")
+                except Exception as e:
+                    logger.error(f"Failed to save prediction to Firestore: {e}")
+            else:
+                # Local JSONL fallback
+                try:
+                    out_path = os.getenv('PREDICTIONS_JSONL_PATH', 'predictions.jsonl')
+                    parent = os.path.dirname(out_path)
+                    if parent and not os.path.exists(parent):
+                        os.makedirs(parent, exist_ok=True)
+                    # Ensure timestamp is serializable
+                    local_doc = dict(doc)
+                    if isinstance(local_doc.get('timestamp'), datetime):
+                        local_doc['timestamp'] = local_doc['timestamp'].isoformat()
+                    with open(out_path, 'a', encoding='utf-8') as f:
+                        f.write(json.dumps(local_doc, ensure_ascii=False) + '\n')
+                    logger.info(f"Saved prediction to local JSONL fallback: {out_path}")
+                except Exception as e:
+                    logger.error(f"Failed to write prediction to local JSONL: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error while persisting prediction: {e}")
 
         logger.info(f"Prediction successful for {current_user}: {prediction['health_status']}")
         return result
